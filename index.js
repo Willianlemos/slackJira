@@ -1,3 +1,4 @@
+// index.js
 import 'dotenv/config';
 import fs from 'fs';
 import express from 'express';
@@ -8,6 +9,7 @@ const {
   SLACK_TOKEN,
   SLACK_CHANNEL_ID,
   POLL_INTERVAL_MS = 15000,
+  BACKFILL_SECONDS = 300, // ao iniciar, busca últimos N segundos
   JIRA_BASE,
   JIRA_EMAIL,
   JIRA_API_TOKEN,
@@ -19,22 +21,23 @@ if (!SLACK_TOKEN || !SLACK_CHANNEL_ID) throw new Error('Faltam SLACK_TOKEN/SLACK
 if (!JIRA_BASE || !JIRA_EMAIL || !JIRA_API_TOKEN) throw new Error('Faltam credenciais do Jira');
 
 const slack = new WebClient(SLACK_TOKEN);
-const STATE_FILE = './state.json';
-let lastSlackMessage = null; // debug: último evento bruto do Slack
+
+// ---------------- Persistência de estado ----------------
+const STATE_FILE = process.env.STATE_FILE || './state.json';
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
 }
 function saveState(s) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {}
 }
 let state = loadState();
 if (!state[SLACK_CHANNEL_ID]) {
-  // começa dos últimos 5 minutos para evitar flood
-  state[SLACK_CHANNEL_ID] = { lastTs: (Date.now() / 1000 - 300).toString() };
+  state[SLACK_CHANNEL_ID] = { lastTs: (Date.now() / 1000 - Number(BACKFILL_SECONDS)).toString() };
   saveState(state);
 }
 
+// ---------------- Utils para extrair texto do Slack ----------------
 function extractText(msg) {
   if (msg.text) return msg.text;
   if (Array.isArray(msg.blocks)) {
@@ -66,9 +69,7 @@ function extractText(msg) {
   return '';
 }
 
-// (removido) toAdfDocument: usaremos apenas toAdfFromSlackText
-
-// Converte texto com sintaxe básica do Slack (<url|texto>) para ADF com links
+// Converte texto Slack (<url|texto>) para ADF (Jira)
 function toAdfFromSlackText(plainText) {
   const text = String(plainText || '');
   const lines = text.split('\n');
@@ -89,7 +90,6 @@ function toAdfFromSlackText(plainText) {
     if (lastIndex < line.length) {
       parts.push({ type: 'text', text: replaceSlackEmojiShortcodes(line.slice(lastIndex)) });
     }
-    // Linha vazia -> parágrafo vazio
     return { type: 'paragraph', content: parts.length ? parts : [] };
   });
   return { type: 'doc', version: 1, content };
@@ -114,54 +114,44 @@ const SLACK_EMOJI_MAP = {
   white_check_mark: '✅',
   heavy_check_mark: '✔️'
 };
-
 function shortcodeToUnicode(name) {
   return SLACK_EMOJI_MAP[name];
 }
-
 function replaceSlackEmojiShortcodes(text) {
   return String(text || '').replace(/:([a-z0-9_+-]+):/gi, (m, p1) => shortcodeToUnicode(p1) || m);
 }
 
+// ---------------- Resumo / descrição ----------------
 function extractSummaryFromText(fullText) {
   const lines = String(fullText || '')
     .split(/\r?\n/)
     .map(l => l.trim())
     .filter(Boolean);
-
   const stripSlackLinks = (line) => line.replace(/<([^|>]+)\|([^>]+)>/g, '$2');
 
-  // 1) Procura qualquer linha que contenha "Triggered:" (inclusive como label de link)
   for (const raw of lines) {
     const text = stripSlackLinks(raw);
     const idx = text.toLowerCase().indexOf('triggered:');
-    if (idx >= 0) {
-      return sanitizeSummary(text.slice(idx));
-    }
+    if (idx >= 0) return sanitizeSummary(text.slice(idx));
   }
-  // 2) Fallback: primeira linha (sem markup)
   return sanitizeSummary(stripSlackLinks(lines[0] || ''));
 }
 
 function extractSummaryFromMessage(msg) {
-  // 1) Preferir título/fallback do attachment quando contém "Triggered:"
   if (Array.isArray(msg.attachments)) {
     for (const a of msg.attachments) {
       if (a?.title && /triggered:/i.test(a.title)) return sanitizeSummary(a.title);
       if (a?.fallback && /triggered:/i.test(a.fallback)) return sanitizeSummary(a.fallback);
     }
-    // 2) Sem "Triggered:", mas tem título → usar o primeiro título
     const firstTitle = msg.attachments.find(a => a?.title)?.title;
     if (firstTitle) return sanitizeSummary(firstTitle);
   }
-  // 3) Fallback para o texto bruto
   const text = extractText(msg);
   return extractSummaryFromText(text);
 }
 
 function extractImageUrlsFromMessage(msg) {
   const images = [];
-  // Files anexados
   if (Array.isArray(msg.files)) {
     for (const f of msg.files) {
       if (String(f.mimetype || '').startsWith('image/') && f.url_private) {
@@ -169,15 +159,11 @@ function extractImageUrlsFromMessage(msg) {
       }
     }
   }
-  // Attachments com image_url
   if (Array.isArray(msg.attachments)) {
     for (const a of msg.attachments) {
-      if (a.image_url) {
-        images.push({ url: a.image_url, filename: 'attachment.png', private: false });
-      }
+      if (a.image_url) images.push({ url: a.image_url, filename: 'attachment.png', private: false });
     }
   }
-  // Blocos de imagem
   if (Array.isArray(msg.blocks)) {
     for (const b of msg.blocks) {
       if (b.type === 'image' && b.image_url) {
@@ -195,7 +181,7 @@ function extractImageUrlsFromMessage(msg) {
   return images;
 }
 
-// Monta documento ADF com texto e imagens externas, mantendo ordem
+// Monta ADF com texto e imagens externas
 function buildDescriptionAdf({ permalink, text, message }) {
   const images = extractImageUrlsFromMessage(message);
   const imageNodes = images.slice(0, 5).map(img => ({
@@ -209,7 +195,6 @@ function buildDescriptionAdf({ permalink, text, message }) {
     ]
   }));
 
-  // Se houver attachment, montar título clicável e corpo estruturado
   if (Array.isArray(message?.attachments) && message.attachments.length > 0) {
     const a = message.attachments[0];
     const content = [];
@@ -244,13 +229,11 @@ function buildDescriptionAdf({ permalink, text, message }) {
     return { type: 'doc', version: 1, content: [...content, ...imageNodes] };
   }
 
-  // Fallback: texto linear + imagens
   const bodyDoc = toAdfFromSlackText(text);
   return { type: 'doc', version: 1, content: [...(bodyDoc.content || []), ...imageNodes] };
 }
 
 function buildLinearTextFromMessage(msg) {
-  // Usa attachment principal quando existir, preservando a ordem desejada
   if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
     const a = msg.attachments[0];
     const parts = [];
@@ -265,11 +248,10 @@ function buildLinearTextFromMessage(msg) {
     }
     return parts.join('\n');
   }
-  // Fallback: texto extraído dos blocks/text
   return extractText(msg);
 }
 
-// ---------------- Jira metadata helpers ----------------
+// ---------------- Jira helpers ----------------
 const jiraHeaders = { 'Content-Type': 'application/json', Accept: 'application/json' };
 
 function normalizeString(value) {
@@ -290,8 +272,8 @@ async function jiraGet(path) {
 }
 
 let jiraMetaCache = {
-  priorities: null, // [{id, name}] (prioridades permitidas para o projeto/tipo)
-  assuntoOptions: null // [{id, value}]
+  priorities: null,      // [{id, name}]
+  assuntoOptions: null   // [{id, value}]
 };
 
 async function fetchGlobalPriorities() {
@@ -319,7 +301,6 @@ async function fetchProjectPriorities() {
       return pr.allowedValues.map(v => ({ id: v.id, name: v.name }));
     }
   } catch {}
-  // Fallback global (pode não refletir o esquema do projeto)
   return await fetchGlobalPriorities();
 }
 
@@ -349,11 +330,9 @@ function resolvePriorityId(inputPriority) {
   const normalizedInput = normalizeString(inputPriority);
   const list = jiraMetaCache.priorities || [];
 
-  // 1) Tentativa por igualdade exata (com/sem acento, case-insensitive)
   let found = list.find(p => normalizeString(p.name) === normalizedInput);
   if (found) return found.id;
 
-  // 2) Mapear sinônimos comuns
   const synonyms = {
     alta: ['alta', 'high'],
     media: ['media', 'média', 'medium'],
@@ -367,8 +346,6 @@ function resolvePriorityId(inputPriority) {
       if (found) return found.id;
     }
   }
-
-  // 3) Contém (fallback)
   found = list.find(p => normalizeString(p.name).includes(normalizedInput));
   return found?.id || null;
 }
@@ -383,7 +360,6 @@ function resolveAssuntoOptionId(label) {
 async function createJiraIssue({ summary, description, descriptionAdf, priority = 'Medium' }) {
   await ensureJiraMetaLoaded();
 
-  // Prioridade via ID (evita problemas de idioma)
   const priorityIdEnv = process.env.JIRA_PRIORITY_ID && String(process.env.JIRA_PRIORITY_ID).trim();
   const priorityId = priorityIdEnv || resolvePriorityId(priority);
   if (!priorityId) {
@@ -394,7 +370,6 @@ async function createJiraIssue({ summary, description, descriptionAdf, priority 
     );
   }
 
-  // Assunto obrigatório (customfield_13712)
   const assuntoLabel = process.env.JIRA_ASSUNTO_DEFAULT || 'Plantão - API / Transportadoras';
   const assuntoIdEnv = process.env.JIRA_ASSUNTO_ID && String(process.env.JIRA_ASSUNTO_ID).trim();
   const assuntoId = assuntoIdEnv || resolveAssuntoOptionId(assuntoLabel);
@@ -410,28 +385,27 @@ async function createJiraIssue({ summary, description, descriptionAdf, priority 
   const descriptionDoc = descriptionAdf || toAdfFromSlackText(description);
 
   const baseFields = {
-      project: { key: JIRA_PROJECT_KEY },
-      issuetype: { name: JIRA_ISSUE_TYPE },
-      summary: sanitizeSummary(summary),
-      description: descriptionDoc,
+    project: { key: JIRA_PROJECT_KEY },
+    issuetype: { name: JIRA_ISSUE_TYPE },
+    summary: sanitizeSummary(summary),
+    description: descriptionDoc,
     customfield_13712: { id: assuntoId }
   };
 
   const priorityNameFromCache = (jiraMetaCache.priorities || []).find(p => p.id === priorityId)?.name;
 
-  // 1ª tentativa: prioridade por ID
   try {
     const payload = { fields: { ...baseFields, priority: { id: priorityId } } };
-  const { data } = await axios.post(url, payload, {
-    auth: { username: JIRA_EMAIL, password: JIRA_API_TOKEN },
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' }
-  });
-  return data.key;
+    const { data } = await axios.post(url, payload, {
+      auth: { username: JIRA_EMAIL, password: JIRA_API_TOKEN },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' }
+    });
+    return data.key;
   } catch (e) {
     const msg = e?.response?.data?.errors?.priority || e?.response?.data?.errorMessages?.[0] || '';
     const looksLikeInvalidPriority = /inválid|invalid/i.test(String(msg));
     if (!looksLikeInvalidPriority) throw e;
-    // 2ª tentativa: prioridade por nome permitido
+
     const priorityName = priorityNameFromCache || priority;
     const payloadByName = { fields: { ...baseFields, priority: { name: priorityName } } };
     const { data } = await axios.post(url, payloadByName, {
@@ -441,6 +415,9 @@ async function createJiraIssue({ summary, description, descriptionAdf, priority 
     return data.key;
   }
 }
+
+// ---------------- Poll do Slack ----------------
+let lastSlackMessage = null;
 
 async function pollOnce() {
   const oldest = state[SLACK_CHANNEL_ID].lastTs || '0';
@@ -453,26 +430,23 @@ async function pollOnce() {
 
   if (!resp.ok || !resp.messages?.length) return;
 
-  // processa em ordem cronológica
   const messages = resp.messages
     .filter(m => m.ts > oldest)
     .sort((a, b) => Number(a.ts) - Number(b.ts));
 
   for (const m of messages) {
-    lastSlackMessage = m; // guarda último evento bruto
-    state[SLACK_CHANNEL_ID].lastTs = m.ts; // avança mesmo se pular
+    lastSlackMessage = m;
+    state[SLACK_CHANNEL_ID].lastTs = m.ts;
     const text = buildLinearTextFromMessage(m);
     if (!text) continue;
 
     const lowered = text.toLowerCase();
-    if (lowered.includes('recovered')) continue;                  // ignorar recovered
+    if (lowered.includes('recovered')) continue;
     if (!(/\btriggered\b/i.test(text) || /Triggered:/.test(text))) continue;
 
-    // Deriva resumo e prioridade
     const summary = extractSummaryFromMessage(m);
     const priority = 'High';
 
-    // Permalink da msg
     let permalink = '';
     try {
       const pl = await slack.chat.getPermalink({ channel: SLACK_CHANNEL_ID, message_ts: m.ts });
@@ -480,12 +454,11 @@ async function pollOnce() {
     } catch {}
 
     const description = text;
-    const descriptionAdf = buildDescriptionAdf({ permalink, text, message: m, includeHeader: false });
+    const descriptionAdf = buildDescriptionAdf({ permalink, text, message: m });
 
     try {
       const issueKey = await createJiraIssue({ summary, description, descriptionAdf, priority });
       console.log(`✅ Criada issue ${issueKey} (prio ${priority})`);
-      // imagens já estão embutidas na descrição (ADF media external)
     } catch (e) {
       console.error('❌ Erro ao criar issue:', e.response?.data || e.message);
     }
@@ -494,12 +467,15 @@ async function pollOnce() {
   saveState(state);
 }
 
+// Inicia o polling
 setInterval(() => {
   pollOnce().catch(err => console.error('poll error:', err.message));
 }, Number(POLL_INTERVAL_MS));
 
+// ---------------- HTTP server (health/debug) ----------------
 const app = express();
 app.get('/', (_req, res) => res.send('ok'));
+app.get('/health', (_req, res) => res.send('ok'));
 app.get('/meta', async (_req, res) => {
   try {
     await ensureJiraMetaLoaded();
@@ -515,5 +491,8 @@ app.get('/debug/last', (_req, res) => {
   if (!lastSlackMessage) return res.status(404).json({ error: 'Ainda não há mensagem processada.' });
   res.json(lastSlackMessage);
 });
-app.listen(3000, () => console.log('Servidor rodando em http://localhost:3000'));
-console.log('⏱️ Iniciando poll…');
+
+// Porta para Render (PORT) ou 3000 local
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Servidor rodando na porta ${port}`));
+console.log(`⏱️ Iniciando poll a cada ${POLL_INTERVAL_MS}ms…`);
