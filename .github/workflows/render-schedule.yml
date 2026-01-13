@@ -1,10 +1,11 @@
 name: Manage Render Service Weekly
 
 on:
+  workflow_dispatch: # Ativa o botão para teste manual
   schedule:
-    # 00:00 UTC de Segunda-feira (Início da semana útil)
+    # 00:00 UTC de Segunda-feira (Liga o serviço)
     - cron: '0 0 * * 1'
-    # 23:59 UTC de Sexta-feira (Fim da semana útil)
+    # 23:59 UTC de Sexta-feira (Desliga o serviço)
     - cron: '59 23 * * 5'
 
 jobs:
@@ -13,15 +14,17 @@ jobs:
     steps:
       - name: Resume or Suspend Service
         run: |
-          # Pega o dia da semana (1-7, onde 1 é segunda e 5 é sexta)
-          DAY_OF_WEEK=$(date +%u)
+          # Pega o dia da semana (1=Segunda, 5=Sexta)
+          # No UTC, segunda-feira é dia 1
+          DAY=$(date +%u)
           
-          if [ "$DAY_OF_WEEK" -eq "1" ]; then
+          # Se rodado manualmente OU se for segunda-feira, ele liga (resume)
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] || [ "$DAY" -eq "1" ]; then
             ACTION="resume"
-            echo "Iniciando semana: Ligando serviço..."
+            echo "Ação definida: LIGAR serviço"
           else
             ACTION="suspend"
-            echo "Encerrando semana: Suspendendo serviço..."
+            echo "Ação definida: DESLIGAR serviço"
           fi
           
           curl --request POST \
