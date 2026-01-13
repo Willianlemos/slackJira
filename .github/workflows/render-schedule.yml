@@ -1,0 +1,30 @@
+name: Manage Render Service Weekly
+
+on:
+  schedule:
+    # 00:00 UTC de Segunda-feira (Início da semana útil)
+    - cron: '0 0 * * 1'
+    # 23:59 UTC de Sexta-feira (Fim da semana útil)
+    - cron: '59 23 * * 5'
+
+jobs:
+  manage_service:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resume or Suspend Service
+        run: |
+          # Pega o dia da semana (1-7, onde 1 é segunda e 5 é sexta)
+          DAY_OF_WEEK=$(date +%u)
+          
+          if [ "$DAY_OF_WEEK" -eq "1" ]; then
+            ACTION="resume"
+            echo "Iniciando semana: Ligando serviço..."
+          else
+            ACTION="suspend"
+            echo "Encerrando semana: Suspendendo serviço..."
+          fi
+          
+          curl --request POST \
+            --url https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/$ACTION \
+            --header 'accept: application/json' \
+            --header 'authorization: Bearer ${{ secrets.RENDER_API_KEY }}'
